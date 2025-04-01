@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2024 The HuggingFace Authors.
 
+import re
 from collections.abc import Mapping
 from typing import Any, Optional, Union
 
@@ -63,13 +64,26 @@ HF_TO_CROISSANT_VALUE_TYPE = {
 }
 
 
+def escape_jsonpath_key(feature_name: str) -> str:
+    """Escape single quotes and brackets in the feature name so that it constitutes a valid JSONPath."""
+    if "/" in feature_name or "'" in feature_name or "]" in feature_name or "[" in feature_name:
+        escaped_name = re.sub(r"(?<!\\)'", r"\'", feature_name)
+        escaped_name = re.sub(r"(?<!\\)\[", r"\[", escaped_name)
+        escaped_name = re.sub(r"(?<!\\)\]", r"\]", escaped_name)
+        return f"['{escaped_name}']"
+    return feature_name
+
+
 def get_source(
-    distribution_name: str, column: str, add_transform: bool, json_path: Optional[str] = None
+    distribution_name: str, column: str, add_transform: bool, json_path: Optional[list[str]] = None
 ) -> dict[str, Any]:
     """Returns a Source dictionary for a Field."""
-    source = {"fileSet": {"@id": distribution_name}, "extract": {"column": column}}
+    source: dict[str, Any] = {"fileSet": {"@id": distribution_name}, "extract": {"column": column}}
     if add_transform and json_path:
-        source["transform"] = {"jsonPath": json_path}
+        if len(json_path) == 1:
+            source["transform"] = {"jsonPath": json_path[0]}
+        else:
+            source["transform"] = [{"jsonPath": path} for path in json_path]
     return source
 
 
@@ -79,7 +93,7 @@ def feature_to_croissant_field(
     column: str,
     feature: Any,
     add_transform: bool = False,
-    json_path: Optional[str] = None,
+    json_path: Optional[list[str]] = None,
 ) -> Union[dict[str, Any], None]:
     """Converts a Hugging Face Datasets feature to a Croissant field or None if impossible."""
     if isinstance(feature, Value) and feature.dtype in HF_TO_CROISSANT_VALUE_TYPE:
@@ -110,30 +124,42 @@ def feature_to_croissant_field(
         }
     # Field with sub-fields.
     elif isinstance(feature, dict):
+        sub_fields = []
+        if not json_path:
+            json_path = []
+        for subfeature_name, sub_feature in feature.items():
+            subfeature_jsonpath = escape_jsonpath_key(subfeature_name)
+            sub_json_path = json_path + [subfeature_jsonpath]
+            f = feature_to_croissant_field(
+                distribution_name,
+                f"{field_name}/{subfeature_name}",
+                column,
+                sub_feature,
+                add_transform=True,
+                json_path=sub_json_path,
+            )
+            sub_fields.append(f)
         return {
             "@type": "cr:Field",
             "@id": field_name,
-            "subField": [
-                feature_to_croissant_field(
-                    distribution_name,
-                    f"{field_name}/{subfeature_name}",
-                    column,
-                    sub_feature,
-                    add_transform=True,
-                    json_path=subfeature_name,
-                )
-                for subfeature_name, sub_feature in feature.items()
-            ],
+            "subField": sub_fields,
         }
-    elif isinstance(feature, (Sequence, LargeList, list)):
-        if isinstance(feature, (Sequence, LargeList)):
-            sub_feature = feature.feature
-        else:
+    elif isinstance(feature, (LargeList, list, Sequence)):
+        array_shape = []
+        if isinstance(feature, list):
             if len(feature) != 1:
                 return None
             sub_feature = feature[0]
+            array_shape.append(-1)
+        else:
+            array_shape.append(feature.length)
+            sub_feature = feature.feature
+        while isinstance(sub_feature, Sequence):
+            array_shape.append(sub_feature.length)
+            sub_feature = sub_feature.feature
         field = feature_to_croissant_field(distribution_name, field_name, column, sub_feature)
         if field:
-            field["repeated"] = True
+            field["isArray"] = True
+            field["arrayShape"] = ",".join([str(shape) if shape else "-1" for shape in array_shape])
             return field
     return None
